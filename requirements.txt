@@ -1,0 +1,8 @@
+streamlit
+streamlit-authenticator
+streamlit-folium
+folium
+pandas
+plotly
+shapely
+requests
