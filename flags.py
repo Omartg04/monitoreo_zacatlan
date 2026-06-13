@@ -37,30 +37,37 @@ import kpis
 
 # ── 1. Duración de entrevista ─────────────────────────────────────────────────
 
+
 def flag_duracion(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Rojo:    duracion_min < DUR_MIN_MIN  o  > DUR_MAX_MIN (entrevista
-             imposiblemente corta o sospechosamente larga / pausada).
-    Amarillo: dentro de ±20% del límite inferior (zona de alerta temprana).
-    Requiere columna `duracion_confiable` para excluir días con carga manual
-    por lote (igual que en bubble_connector — ajustar si Zacatlán no aplica).
+    Evalúa duración SOLO en encuestas terminadas (`terminada == True`).
+    Las encuestas en progreso tienen `fecha_modificacion` aún abierta y una
+    duración artificialmente corta que inflaría falsos positivos.
+
+    Rojo:    duracion_min < DUR_MIN_MIN  o  > DUR_MAX_MIN
+    Amarillo: entre DUR_MIN_MIN y DUR_MIN_MIN × 1.2 (zona de alerta temprana)
+    No evaluable (flag_duracion_nivel = None): encuesta no terminada.
     """
     d = df.copy()
     dur = d["duracion_min"]
-    confiable = d.get("duracion_confiable", True)
+    confiable = d.get("duracion_confiable", pd.Series(True, index=d.index))
+    terminada = d.get("terminada", pd.Series(False, index=d.index))
+
+    evaluable = terminada & confiable
 
     muy_corta = dur < DUR_MIN_MIN
-    muy_larga = dur > DUR_MAX_MIN
-    cerca_min = dur.between(DUR_MIN_MIN, DUR_MIN_MIN * 1.2)
+    muy_larga  = dur > DUR_MAX_MIN
+    cerca_min  = dur.between(DUR_MIN_MIN, DUR_MIN_MIN * 1.2)
 
-    rojo = (muy_corta | muy_larga) & confiable
-    amarillo = cerca_min & confiable & ~rojo
+    rojo     = muy_corta | muy_larga
+    amarillo = cerca_min & ~rojo
 
-    d["flag_duracion"] = rojo | amarillo
+    d["flag_duracion"] = evaluable & (rojo | amarillo)
     d["flag_duracion_nivel"] = None
-    d.loc[amarillo, "flag_duracion_nivel"] = "amarillo"
-    d.loc[rojo, "flag_duracion_nivel"] = "rojo"
+    d.loc[evaluable & amarillo, "flag_duracion_nivel"] = "amarillo"
+    d.loc[evaluable & rojo,     "flag_duracion_nivel"] = "rojo"
     return d
+
 
 
 # ── 2. Straightlining ─────────────────────────────────────────────────────────
@@ -75,16 +82,14 @@ def _es_straightline(row: pd.Series, columnas: list[str]) -> bool:
 
 def flag_straightlining(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Evalúa cada batería de BATERIAS_STRAIGHTLINING. Si TODAS las respuestas de
-    una batería 'bloque7_*' (7 ítems) son idénticas → rojo. Si ocurre solo en
-    una batería 'bloque6_*' (5 ítems) → amarillo. Si ocurre en >=2 baterías
-    bloque7 → rojo reforzado (`flag_straightlining_n_baterias`).
+    Evalúa SOLO encuestas terminadas — las incompletas tienen baterías
+    parciales que _es_straightline ya filtra, pero conviene ser explícitos.
 
-    UMBRAL_STRAIGHTLINING_BLOQUE7/6 (config.py) documentan el tamaño esperado
-    de cada batería (7 y 5 ítems respectivamente); el criterio "todas iguales"
-    ya exige cobertura completa vía _es_straightline.
+    Si TODAS las respuestas de una batería 'bloque7_*' (7 ítems) son idénticas
+    → rojo. Si ocurre solo en una batería 'bloque6_*' (5 ítems) → amarillo.
     """
     d = df.copy()
+    terminada = d.get("terminada", pd.Series(False, index=d.index))
 
     detalle = pd.DataFrame(index=d.index)
     for nombre, columnas in BATERIAS_STRAIGHTLINING.items():
@@ -103,13 +108,13 @@ def flag_straightlining(df: pd.DataFrame) -> pd.DataFrame:
     ) if not detalle.empty else [[] for _ in range(len(d))]
     d["flag_straightlining_n_baterias"] = n_b7 + n_b6
 
-    rojo = n_b7 >= 1
-    amarillo = (~rojo) & (n_b6 >= 1)
+    rojo     = terminada & (n_b7 >= 1)
+    amarillo = terminada & (~rojo) & (n_b6 >= 1)
 
     d["flag_straightlining"] = rojo | amarillo
     d["flag_straightlining_nivel"] = None
     d.loc[amarillo, "flag_straightlining_nivel"] = "amarillo"
-    d.loc[rojo, "flag_straightlining_nivel"] = "rojo"
+    d.loc[rojo,     "flag_straightlining_nivel"] = "rojo"
     return d
 
 
@@ -212,12 +217,15 @@ _PATRON_NO_SABE   = re.compile(r"no\s*sabe|no\s*contesta|n\/?d", re.IGNORECASE)
 
 def flag_inconsistencia_conocimiento(df: pd.DataFrame) -> pd.DataFrame:
     """
+    Evalúa SOLO encuestas terminadas — en incompletas Bloque 7 puede estar
+    vacío aunque Bloque 6 ya tenga respuesta, generando falsos positivos.
+
     Para cada candidato: si conocimiento_<cand> indica "no lo conoce" pero
-    el entrevistado SÍ emitió opiniones sustantivas (no "no sabe/no contesta")
-    en >=1 de los 7 atributos del Bloque 7 para ese mismo candidato, se marca
-    inconsistencia. Amarillo si ocurre con 1 candidato, rojo si ocurre con 2+.
+    el entrevistado SÍ emitió opiniones sustantivas en >=1 atributo del Bloque 7
+    → inconsistencia. Amarillo si ocurre con 1 candidato, rojo si ocurre con 2+.
     """
     d = df.copy()
+    terminada = d.get("terminada", pd.Series(False, index=d.index))
     n_incons = pd.Series(0, index=d.index)
     detalle: list[list[str]] = [[] for _ in range(len(d))]
 
@@ -237,7 +245,7 @@ def flag_inconsistencia_conocimiento(df: pd.DataFrame) -> pd.DataFrame:
             for c in cols_atrib
         }).any(axis=1)
 
-        incons_cand = no_conoce & opina_sustantivo
+        incons_cand = terminada & no_conoce & opina_sustantivo
         n_incons += incons_cand.astype(int)
         for i, flagged in enumerate(incons_cand):
             if flagged:
