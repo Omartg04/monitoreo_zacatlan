@@ -672,13 +672,6 @@ with tab3:
                 use_container_width=True, hide_index=True,
             )
 
-        # ── Descarga ─────────────────────────────────────────────────────────────
-        st.markdown("---")
-        cols_excluir_csv = {"flag_straightlining_detalle", "flag_inconsistencia_conocimiento_detalle",
-                             "google_address", "latitud", "longitud"}
-        cols_csv = [c for c in df.columns if c not in cols_excluir_csv]
-        csv_out = df[cols_csv].to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Descargar vista con flags (CSV)", csv_out, "zacatlan_pie_flags.csv", "text/csv")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -814,11 +807,3 @@ if tab4 is not None:
                 show_chart(pct_bar(df, "aprobacion_gobernador", "P22.2 Aprobación — Alejandro Armenta Mier"))
             with cc7:
                 show_chart(pct_bar(df, "aprobacion_presidenta", "P22.3 Aprobación — Claudia Sheinbaum Pardo"))
-
-            # ── Descarga ─────────────────────────────────────────────────────────
-            st.markdown("---")
-            cols_excluir_csv = {"flag_straightlining_detalle", "flag_inconsistencia_conocimiento_detalle",
-                                 "google_address", "latitud", "longitud"}
-            cols_csv = [c for c in df.columns if c not in cols_excluir_csv]
-            csv_out = df[cols_csv].to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Descargar resultados (CSV)", csv_out, "zacatlan_pie_resultados.csv", "text/csv")
