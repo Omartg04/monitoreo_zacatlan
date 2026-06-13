@@ -195,6 +195,23 @@ def color_dur(val):
     return                                       "background-color:#FFF3CD;color:#856404;font-weight:600"
 
 
+def _bounds_from_geometry(geometry: dict):
+    """Bounds [[lat_min,lon_min],[lat_max,lon_max]] para folium.fit_bounds, sin shapely."""
+    lons, lats = [], []
+
+    def _walk(coords):
+        if isinstance(coords[0], (int, float)):
+            lons.append(coords[0]); lats.append(coords[1])
+        else:
+            for c in coords:
+                _walk(c)
+
+    _walk(geometry["coordinates"])
+    if not lons:
+        return None
+    return [[min(lats), min(lons)], [max(lats), max(lons)]]
+
+
 def pct_bar(df_in, campo, titulo, orden=None, colors=None, height=260):
     if campo not in df_in.columns or df_in[campo].dropna().empty:
         return None
@@ -461,13 +478,31 @@ with tab2:
 
     if GEOJSON is None:
         st.warning(f"No se encontró {GEOJSON_SECCIONES}. Colócalo junto a app.py.")
+    elif df_raw.empty:
+        st.info("Sin datos disponibles todavía.")
     else:
-        av_sec_all = kpis.avance_por_seccion(df)
+        # df para el mapa: respeta equipo y fecha (sidebar) pero NO el filtro de
+        # sección — así el choropleth muestra el avance real de TODAS las
+        # secciones, y el selector de abajo solo controla zoom/resaltado.
+        df_mapa = df_raw.copy()
+        if equipo_sel != "Todos los equipos":
+            df_mapa = df_mapa[df_mapa["equipo"] == equipo_sel]
+        if fecha_sel and "fecha" in df_mapa.columns:
+            df_mapa = df_mapa[df_mapa["fecha"].isin(fecha_sel)]
+
+        av_sec_all = kpis.avance_por_seccion(df_mapa)
         av_lookup = av_sec_all.set_index("seccion").to_dict(orient="index")
 
-        mapa = folium.Map(location=ZACATLAN_CENTRO, zoom_start=ZACATLAN_ZOOM, tiles="CartoDB positron")
+        secciones_mapa = sorted(av_sec_all["seccion"].tolist())
+        zoom_sel = st.selectbox(
+            "🔍 Resaltar / hacer zoom a sección", ["Todas"] + secciones_mapa,
+            format_func=lambda s: "Todas" if s == "Todas"
+            else f"{s} — {METAS_POR_SECCION.get(s, {}).get('localidad', '')}",
+            key="zoom_seccion_mapa",
+        )
 
         geojson_enriq = copy.deepcopy(GEOJSON)
+        bounds_zoom = None
         for feature in geojson_enriq["features"]:
             sec = feature["properties"].get("seccion")
             info = av_lookup.get(sec)
@@ -487,17 +522,27 @@ with tab2:
                     "estado":    "🟢 En meta" if info["pct"] >= 100 else
                                  ("🟡 En riesgo" if info["pct"] >= 60 else "🔴 Bajo meta"),
                 })
+            if zoom_sel != "Todas" and sec == zoom_sel:
+                bounds_zoom = _bounds_from_geometry(feature["geometry"])
 
         def style_sec(feature):
             props = feature["properties"]
+            resaltada = zoom_sel != "Todas" and props.get("seccion") == zoom_sel
             if props.get("estado") == "Fuera de muestra":
-                return {"fillColor": "#CCCCCC", "color": "#999999", "weight": 0.6, "fillOpacity": 0.35}
-            pct = props.get("pct", 0)
-            if pct >= 100:
-                return {"fillColor": VERDE,    "color": "#1A5C42", "weight": 1.4, "fillOpacity": 0.78}
-            if pct >= 60:
-                return {"fillColor": AMARILLO, "color": "#8a6200", "weight": 1.4, "fillOpacity": 0.78}
-            return     {"fillColor": ROJO,     "color": "#7b1a14", "weight": 1.4, "fillOpacity": 0.78}
+                base = {"fillColor": "#CCCCCC", "color": "#999999", "weight": 0.6, "fillOpacity": 0.35}
+            else:
+                pct = props.get("pct", 0)
+                if pct >= 100:
+                    base = {"fillColor": VERDE,    "color": "#1A5C42", "weight": 1.4, "fillOpacity": 0.78}
+                elif pct >= 60:
+                    base = {"fillColor": AMARILLO, "color": "#8a6200", "weight": 1.4, "fillOpacity": 0.78}
+                else:
+                    base = {"fillColor": ROJO,     "color": "#7b1a14", "weight": 1.4, "fillOpacity": 0.78}
+            if resaltada:
+                base = {**base, "color": AZUL, "weight": 4}
+            elif zoom_sel != "Todas":
+                base = {**base, "fillOpacity": base["fillOpacity"] * 0.35}
+            return base
 
         tooltip_html = folium.GeoJsonTooltip(
             fields=["seccion", "localidad", "equipo", "estado", "avance", "meta", "pct"],
@@ -511,33 +556,78 @@ with tab2:
             ),
         )
 
+        mapa = folium.Map(location=ZACATLAN_CENTRO, zoom_start=ZACATLAN_ZOOM, tiles="CartoDB positron")
+
         folium.GeoJson(
             geojson_enriq, style_function=style_sec,
             highlight_function=lambda f: {"fillOpacity": 0.95, "weight": 2.5, "color": AZUL},
             tooltip=tooltip_html, name="Secciones electorales",
         ).add_to(mapa)
 
-        # Marcadores de georreferenciación fuera de zona (flag_georef)
-        if "flag_georef" in df.columns:
-            df_geo = df[df["flag_georef"] & df["latitud"].notna() & df["longitud"].notna()]
-            for _, r in df_geo.iterrows():
-                color = "red" if r["flag_georef_nivel"] == "rojo" else "orange"
-                folium.CircleMarker(
-                    location=[r["latitud"], r["longitud"]], radius=5,
-                    color=color, fill=True, fill_opacity=0.85,
-                    popup=f"Folio {r['folio']} · sección declarada {r['seccion_electoral']} "
-                          f"· sección por coordenadas {r.get('seccion_georef')}",
-                ).add_to(mapa)
+        # ── Puntos georreferenciados (todos los que tengan lat/lon) ──────────────
+        df_puntos = df_mapa if zoom_sel == "Todas" else df_mapa[df_mapa["seccion_electoral"] == zoom_sel]
+        tiene_coords = df_puntos["latitud"].notna() & df_puntos["longitud"].notna()
+        df_geo_ok = df_puntos[tiene_coords]
+
+        capa_puntos = folium.FeatureGroup(name="Encuestas georreferenciadas", show=True)
+        for _, r in df_geo_ok.iterrows():
+            nivel = r.get("flag_georef_nivel")
+            color = "#C0392B" if nivel == "rojo" else ("#E07B39" if nivel == "amarillo" else "#2E7D5E")
+            folium.CircleMarker(
+                location=[r["latitud"], r["longitud"]], radius=4,
+                color=color, fill=True, fill_opacity=0.85, weight=1,
+                popup=(f"Folio {r['folio']}<br>Sección declarada: {r['seccion_electoral']}<br>"
+                       f"Sección por coordenadas: {r.get('seccion_georef')}<br>"
+                       f"Encuestador: {r.get('encuestador_nombre')}"),
+            ).add_to(capa_puntos)
+        capa_puntos.add_to(mapa)
 
         folium.LayerControl().add_to(mapa)
-        st_folium(mapa, width="100%", height=540, returned_objects=[])
+
+        if bounds_zoom:
+            mapa.fit_bounds(bounds_zoom)
+
+        st_folium(mapa, width="100%", height=540, returned_objects=[], key="mapa_cobertura")
 
         st.caption(
             "🟢 ≥100% de meta · 🟡 60–99% · 🔴 <60% · ⬜ Fuera de la muestra del operativo. "
-            "Puntos rojos/naranjas = encuestas con flag de georreferenciación fuera de zona."
+            "Puntos: 🟢 coincide con sección declarada · 🟠 cae en otra sección de Zacatlán · "
+            "🔴 fuera de Zacatlán (sin coords = no se grafica)."
         )
 
-        # Secciones sin avance
+        # ── Diagnóstico de coordenadas ───────────────────────────────────────────
+        st.markdown('<div class="sec-title">Diagnóstico de georreferenciación</div>', unsafe_allow_html=True)
+
+        n_total = len(df_puntos)
+        n_con = int(tiene_coords.sum())
+        n_sin = n_total - n_con
+        n_rojo_geo = int((df_geo_ok.get("flag_georef_nivel") == "rojo").sum()) if n_con else 0
+        n_amarillo_geo = int((df_geo_ok.get("flag_georef_nivel") == "amarillo").sum()) if n_con else 0
+
+        dc1, dc2, dc3, dc4 = st.columns(4)
+        kpi(dc1, f"{n_con:,}", "Con coordenadas",
+            f"{round(100*n_con/max(n_total,1),1)}% de {n_total:,}")
+        kpi(dc2, f"{n_sin:,}", "Sin coordenadas",
+            f"{round(100*n_sin/max(n_total,1),1)}%",
+            "amarillo" if n_sin else "")
+        kpi(dc3, f"{n_amarillo_geo:,}", "Otra sección de Zacatlán", "flag amarillo",
+            "amarillo" if n_amarillo_geo else "")
+        kpi(dc4, f"{n_rojo_geo:,}", "Fuera de Zacatlán", "flag rojo",
+            "rojo" if n_rojo_geo else "")
+
+        if n_sin:
+            st.caption(
+                f"⚠️ {n_sin:,} registros sin `latitud`/`longitud` — revisar si "
+                "`google_address` está capturando ubicación en Bubble para esos folios."
+            )
+
+        with st.expander("Ver muestra de coordenadas (primeros 20 registros)"):
+            cols_geo = ["folio", "seccion_electoral", "latitud", "longitud",
+                        "seccion_georef", "flag_georef_nivel", "encuestador_nombre"]
+            cols_geo = [c for c in cols_geo if c in df_puntos.columns]
+            st.dataframe(df_puntos[cols_geo].head(20), use_container_width=True, hide_index=True)
+
+        # ── Secciones sin avance ─────────────────────────────────────────────────
         sin_avance = av_sec_all[av_sec_all["avance"] == 0]
         if not sin_avance.empty:
             st.markdown('<div class="sec-title">Secciones sin encuestas registradas</div>', unsafe_allow_html=True)
